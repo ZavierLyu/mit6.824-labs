@@ -1,10 +1,17 @@
 package mr
 
-import "fmt"
-import "log"
-import "net/rpc"
-import "hash/fnv"
-
+import (
+	"encoding/json"
+	"errors"
+	"fmt"
+	"hash/fnv"
+	"io/ioutil"
+	"log"
+	"net/rpc"
+	"os"
+	"sort"
+	"time"
+)
 
 //
 // Map functions return a slice of KeyValue.
@@ -32,39 +39,161 @@ func Worker(mapf func(string, string) []KeyValue,
 	reducef func(string, []string) string) {
 
 	// Your worker implementation here.
-
-	// uncomment to send the Example RPC to the coordinator.
-	// CallExample()
-
+	for {
+		if reply, ok := doHeartBeat(); ok {
+			switch reply.Type {
+			case TaskType_Map:
+				DPrintf("[Worker]: TaskType_Map heartbeat: %v", reply)
+				doMapTask(mapf, reply)
+			case TaskType_Reduce:
+				DPrintf("[Worker]: TaskType_Reduce heartbeat: %v", reply)
+				doReduceTask(reducef, reply)
+			case TaskType_Wait:
+				time.Sleep(1 * time.Second)
+			case TaskType_Completed:
+				DPrintf("[Worker]: TaskType_Completed heartbeat: %v", reply)
+				return
+			default:
+				panic(fmt.Sprintf("Unexpected task type %v", reply.Type))
+			}
+		}
+	}
 }
 
-//
-// example function to show how to make an RPC call to the coordinator.
-//
-// the RPC argument and reply types are defined in rpc.go.
-//
-func CallExample() {
+func doReportTask(task HeartBeatReply, state bool) {
+	args := ReportArgs{task.TaskId, task.Type, state}
+	call("Coordinator.Report", &args, nil)
+}
 
-	// declare an argument structure.
-	args := ExampleArgs{}
-
-	// fill in the argument(s).
-	args.X = 99
-
-	// declare a reply structure.
-	reply := ExampleReply{}
-
-	// send the RPC request, wait for the reply.
-	// the "Coordinator.Example" tells the
-	// receiving server that we'd like to call
-	// the Example() method of struct Coordinator.
-	ok := call("Coordinator.Example", &args, &reply)
-	if ok {
-		// reply.Y should be 100.
-		fmt.Printf("reply.Y %v\n", reply.Y)
-	} else {
-		fmt.Printf("call failed!\n")
+func doHeartBeat() (HeartBeatReply, bool) {
+	args := HeartBeatArgs{}
+	reply := HeartBeatReply{}
+	ok := call("Coordinator.HeartBeat", &args, &reply)
+	if !ok {
+		DPrintf("[Worker]: Heartbeat failed")
+		return HeartBeatReply{}, ok
 	}
+	return reply, ok
+}
+
+func doMapTask(mapf func(string, string) []KeyValue, task HeartBeatReply) {
+	// DPrintf("[Worker]: reading file %v.", task.Filename)
+	content, err := ioutil.ReadFile(task.Filename)
+	if err != nil {
+		DPrintf("[Worker]: cannot read %v. %v", task.Filename, err)
+		doReportTask(task, false)
+		return
+	}
+	kva := mapf(task.Filename, string(content))
+	partitions := make([][]KeyValue, task.NReduce)
+	for _, kv := range kva {
+		pid := ihash(kv.Key) % task.NReduce
+		partitions[pid] = append(partitions[pid], kv)
+	}
+	for rid, kva := range partitions {
+		fn := IntermediateFileName(task.TaskId, rid)
+		f, err := os.CreateTemp("./", fn + ".tmp")
+		if err != nil {
+			DPrintf("[Worker]: failed to create file %v. %v", fn, err)
+			doReportTask(task, false)
+			return
+		}
+		tfn := f.Name()
+		defer func() {
+			if err != nil {
+				f.Close()
+				os.Remove(tfn)
+			}
+		}()
+		jsonEnc := json.NewEncoder(f)
+		for _, kv := range kva {
+			err := jsonEnc.Encode(&kv)
+			if err != nil {
+				DPrintf("[Worker]: failed to encode kv %v. %v", kv, err)
+				return
+			}
+		}
+		if err := f.Sync(); err != nil {
+			DPrintf("[Worker]: failed to sync file %v. %v", f.Name(), err)
+			doReportTask(task, false)
+			return
+		}
+		if err := f.Close(); err != nil {
+			DPrintf("[Worker]: failed to close file %v. %v", f.Name(), err)
+			doReportTask(task, false)
+			return
+		}
+		if _, err := os.Stat(fn); errors.Is(err, os.ErrNotExist) {
+			DPrintf("[Worker]: done writing %v", fn)
+			os.Rename(tfn, fn)
+		}
+	}
+	doReportTask(task, true)
+}
+
+func doReduceTask(reducef func(string, []string) string, task HeartBeatReply) {
+	rid := task.TaskId
+	kva := make([]KeyValue, 0)
+	for mid := 0; mid < task.NMap; mid++ {
+		fileName := IntermediateFileName(mid, rid)
+		file, err := os.Open(fileName)
+		defer file.Close()
+		if err != nil {
+			DPrintf("[Worker]: failed to open file %v. %v", fileName, err)
+			doReportTask(task, false)
+			return
+		}
+		jsonDec := json.NewDecoder(file)
+		for {
+			var kv KeyValue
+			if err := jsonDec.Decode(&kv); err != nil {
+				break
+			}
+			kva = append(kva, kv)
+		}
+	}
+	sort.Slice(kva, func(a, b int) bool {
+		return kva[a].Key < kva[b].Key
+	})
+	fn := fmt.Sprintf("mr-out-%v", rid)
+	f, err := os.CreateTemp("./", fn + ".tmp")
+	if err != nil {
+		DPrintf("[Worker]: failed to create file %v. %v", fn, err)
+		doReportTask(task, false)
+		return
+	}
+	tfn := f.Name() // must be f.Name() since os.CreateTemp adds random string
+	defer func() {
+		if err != nil {
+			f.Close()
+			os.Remove(tfn)
+		}
+	}()
+	for i := 0; i < len(kva); {
+		j := i
+		values := []string{}
+		for j < len(kva) && kva[j].Key == kva[i].Key {
+			values = append(values, kva[j].Value)
+			j++
+		}
+		output := reducef(kva[i].Key, values)
+		fmt.Fprintf(f, "%v %v\n", kva[i].Key, output)
+		i = j
+	}
+	if err := f.Sync(); err != nil {
+		DPrintf("[Worker]: failed to sync file %v. %v", f.Name(), err)
+		doReportTask(task, false)
+		return
+	}
+	if err := f.Close(); err != nil {
+		DPrintf("[Worker]: failed to close file %v. %v", f.Name(), err)
+		doReportTask(task, false)
+		return
+	}
+	if _, err := os.Stat(fn); errors.Is(err, os.ErrNotExist) {
+		os.Rename(tfn, fn)
+	} 
+	doReportTask(task, true)
 }
 
 //
