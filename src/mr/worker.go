@@ -13,28 +13,21 @@ import (
 	"time"
 )
 
-//
 // Map functions return a slice of KeyValue.
-//
 type KeyValue struct {
 	Key   string
 	Value string
 }
 
-//
 // use ihash(key) % NReduce to choose the reduce
 // task number for each KeyValue emitted by Map.
-//
 func ihash(key string) int {
 	h := fnv.New32a()
 	h.Write([]byte(key))
 	return int(h.Sum32() & 0x7fffffff)
 }
 
-
-//
 // main/mrworker.go calls this function.
-//
 func Worker(mapf func(string, string) []KeyValue,
 	reducef func(string, []string) string) {
 
@@ -49,6 +42,7 @@ func Worker(mapf func(string, string) []KeyValue,
 				DPrintf("[Worker]: TaskType_Reduce heartbeat: %v", reply)
 				doReduceTask(reducef, reply)
 			case TaskType_Wait:
+				DPrintf("[Worker]: TaskType_Wait")
 				time.Sleep(1 * time.Second)
 			case TaskType_Completed:
 				DPrintf("[Worker]: TaskType_Completed heartbeat: %v", reply)
@@ -77,7 +71,6 @@ func doHeartBeat() (HeartBeatReply, bool) {
 }
 
 func doMapTask(mapf func(string, string) []KeyValue, task HeartBeatReply) {
-	// DPrintf("[Worker]: reading file %v.", task.Filename)
 	content, err := ioutil.ReadFile(task.Filename)
 	if err != nil {
 		DPrintf("[Worker]: cannot read %v. %v", task.Filename, err)
@@ -92,7 +85,7 @@ func doMapTask(mapf func(string, string) []KeyValue, task HeartBeatReply) {
 	}
 	for rid, kva := range partitions {
 		fn := IntermediateFileName(task.TaskId, rid)
-		f, err := os.CreateTemp("./", fn + ".tmp")
+		f, err := os.CreateTemp("./", fn+".tmp")
 		if err != nil {
 			DPrintf("[Worker]: failed to create file %v. %v", fn, err)
 			doReportTask(task, false)
@@ -124,7 +117,6 @@ func doMapTask(mapf func(string, string) []KeyValue, task HeartBeatReply) {
 			return
 		}
 		if _, err := os.Stat(fn); errors.Is(err, os.ErrNotExist) {
-			DPrintf("[Worker]: done writing %v", fn)
 			os.Rename(tfn, fn)
 		}
 	}
@@ -156,7 +148,7 @@ func doReduceTask(reducef func(string, []string) string, task HeartBeatReply) {
 		return kva[a].Key < kva[b].Key
 	})
 	fn := fmt.Sprintf("mr-out-%v", rid)
-	f, err := os.CreateTemp("./", fn + ".tmp")
+	f, err := os.CreateTemp("./", fn+".tmp")
 	if err != nil {
 		DPrintf("[Worker]: failed to create file %v. %v", fn, err)
 		doReportTask(task, false)
@@ -192,15 +184,13 @@ func doReduceTask(reducef func(string, []string) string, task HeartBeatReply) {
 	}
 	if _, err := os.Stat(fn); errors.Is(err, os.ErrNotExist) {
 		os.Rename(tfn, fn)
-	} 
+	}
 	doReportTask(task, true)
 }
 
-//
 // send an RPC request to the coordinator, wait for the response.
 // usually returns true.
 // returns false if something goes wrong.
-//
 func call(rpcname string, args interface{}, reply interface{}) bool {
 	// c, err := rpc.DialHTTP("tcp", "127.0.0.1"+":1234")
 	sockname := coordinatorSock()

@@ -5,7 +5,7 @@ import (
 	"log"
 )
 
-const Debug = true
+const Debug = false
 
 func IntermediateFileName(mid int, rid int) string {
 	return fmt.Sprintf("mr-%v-%v", mid, rid)

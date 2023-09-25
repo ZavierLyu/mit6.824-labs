@@ -10,33 +10,33 @@ import (
 )
 
 const (
-	PROCESS_TIME time.Duration = 10 * time.Second 
-	TERMINATE_TIME time.Duration = 10 * time.Second
+	PROCESS_TIME     time.Duration = 10 * time.Second
+	TERMINATE_TIME   time.Duration = 10 * time.Second
+	MONITOR_INTERVAL time.Duration = 1 * time.Second
 )
 
 type Coordinator struct {
-	splits 	[]string
-	nMap 	int
+	splits  []string
+	nMap    int
 	nReduce int
-	tasks 	[]Task
-	phase 	JobPhase
-	lastCallAfterDoneTime time.Time
+	tasks   []Task
+	phase   JobPhase
 
 	heartbeatCh chan heartBeatCall
-	reportCh 	chan reportCall
-	
+	reportCh    chan reportCall
+
 	// calls from monitor
-	tranPhaseCh	chan tranCall
-	delayCh		chan delayCall
+	tranPhaseCh chan tranCall
+	delayCh     chan delayCall
 	terminateCh chan struct{}
 }
 
 type Task struct {
-	filename string
-	taskId int
-	taskType TaskType
+	filename   string
+	taskId     int
+	taskType   TaskType
 	taskStatus TaskStatus
-	startTime time.Time
+	startTime  time.Time
 }
 
 type JobPhase int32
@@ -46,6 +46,7 @@ const (
 	JobPhase_Map JobPhase = iota
 	JobPhase_Reduce
 	JobPhase_Done
+	JobPhase_Terminate
 )
 
 const (
@@ -56,33 +57,33 @@ const (
 type heartBeatCall struct {
 	args  *HeartBeatArgs
 	reply *HeartBeatReply
-	ok chan struct{}
+	ok    chan struct{}
 }
 
 type reportCall struct {
 	args  *ReportArgs
 	reply *ReportReply
-	ok chan struct{}
+	ok    chan struct{}
 }
 
 type delayCall struct {
-	taskId 	int
-	ok 		chan struct{}
+	taskId int
+	ok     chan struct{}
 }
 
 type tranCall struct {
-	map2reduce 		bool
-	reduce2done	bool
-	ok				chan struct{}
+	map2reduce  bool
+	reduce2done bool
+	ok          chan struct{}
 }
 
 // Your code here -- RPC handlers for the worker to call.
 
 func (c *Coordinator) HeartBeat(args *HeartBeatArgs, reply *HeartBeatReply) error {
 	call := heartBeatCall{
-		args: args,
+		args:  args,
 		reply: reply,
-		ok: make(chan struct{}),
+		ok:    make(chan struct{}),
 	}
 	c.heartbeatCh <- call
 	<-call.ok
@@ -91,18 +92,16 @@ func (c *Coordinator) HeartBeat(args *HeartBeatArgs, reply *HeartBeatReply) erro
 
 func (c *Coordinator) Report(args *ReportArgs, reply *ReportReply) error {
 	call := reportCall{
-		args: args,
+		args:  args,
 		reply: reply,
-		ok: make(chan struct{}),
+		ok:    make(chan struct{}),
 	}
 	c.reportCh <- call
 	<-call.ok
 	return nil
 }
 
-//
 // start a thread that listens for RPCs from worker.go
-//
 func (c *Coordinator) server() {
 	rpc.Register(c)
 	rpc.HandleHTTP()
@@ -116,56 +115,61 @@ func (c *Coordinator) server() {
 	go http.Serve(l, nil)
 }
 
-// initialize map tasks 
+// initialize map tasks
 func (c *Coordinator) init() {
 	tasks := make([]Task, 0, len(c.splits))
 	for i, file := range c.splits {
 		tasks = append(tasks, Task{
-			filename: file,
-			taskId: i,
-			taskType: TaskType_Map,
+			filename:   file,
+			taskId:     i,
+			taskType:   TaskType_Map,
 			taskStatus: TaskStatus_Idle,
-			startTime: time.Time{},
+			startTime:  time.Time{},
 		})
 	}
 	c.tasks = tasks
 }
 
 func (c *Coordinator) monitor() {
-	// todo
 	// 1. poll all the tasks and check time and send necessary call to the channel
 	// 2. change the job phase accordinigly
 	for {
-		minStartTime := time.Now().Add(-PROCESS_TIME)
-		doneCnt := 0
-		for _, t := range c.tasks {
-			if (t.taskStatus == TaskStatus_InProgress) {
-				if (t.startTime.Before(minStartTime)) {
-					call := delayCall {
-						taskId: t.taskId,
-						ok: make(chan struct{}),
+		if c.phase == JobPhase_Map || c.phase == JobPhase_Reduce {
+			minStartTime := time.Now().Add(-PROCESS_TIME)
+			doneCnt := 0
+			for idx := range c.tasks {
+				t := &c.tasks[idx]
+				if t.taskStatus == TaskStatus_InProgress {
+					timeout := t.startTime.Before(minStartTime)
+					if timeout {
+						call := delayCall{
+							taskId: t.taskId,
+							ok:     make(chan struct{}),
+						}
+						c.delayCh <- call
+						<-call.ok
 					}
-					c.delayCh <- call
-					<-call.ok
+				} else if t.taskStatus == TaskStatus_Completed {
+					doneCnt++
 				}
-			} else if t.taskStatus == TaskStatus_Completed {
-				doneCnt++
 			}
-		}
-		if doneCnt == len(c.tasks) {
-			call := tranCall {
-				map2reduce: c.phase == JobPhase_Map,
-				reduce2done: c.phase == JobPhase_Reduce,
-				ok: make(chan struct{}),
+			if doneCnt == len(c.tasks) {
+				call := tranCall{
+					map2reduce:  c.phase == JobPhase_Map,
+					reduce2done: c.phase == JobPhase_Reduce,
+					ok:          make(chan struct{}),
+				}
+				DPrintf("[Coordinator monitor] donecnt:%v call:%v", doneCnt, call)
+				c.tranPhaseCh <- call
+				<-call.ok
 			}
-			DPrintf("[Coordinator monitor] donecnt:%v call:%v", doneCnt, call)
-			c.tranPhaseCh <- call
-			<-call.ok
-		}
-		if c.phase == JobPhase_Done {
+		} else if c.phase == JobPhase_Done {
+			time.Sleep(TERMINATE_TIME)
+			c.terminateCh <- struct{}{}
 			DPrintf("[Coordinator] terminate monitor()")
 			return
 		}
+		time.Sleep(MONITOR_INTERVAL)
 	}
 }
 
@@ -185,6 +189,7 @@ func (c *Coordinator) run() {
 			c.handleTranPhase(call)
 			call.ok <- struct{}{}
 		case <-c.terminateCh:
+			c.phase = JobPhase_Terminate
 			DPrintf("[Coordinator] terminate run()")
 			return
 		}
@@ -196,14 +201,14 @@ func (c *Coordinator) handleTranPhase(call tranCall) {
 		c.tasks = nil
 		for rid := 0; rid < c.nReduce; rid++ {
 			c.tasks = append(c.tasks, Task{
-				taskId: rid,
-				taskType: TaskType_Reduce,
+				taskId:     rid,
+				taskType:   TaskType_Reduce,
 				taskStatus: TaskStatus_Idle,
 			})
 		}
 		DPrintf("[Coordinator tranphase]: map2reduce")
 		c.phase = JobPhase_Reduce
-		} else if call.reduce2done {
+	} else if call.reduce2done {
 		DPrintf("[Coordinator tranphase]: reduce2done")
 		c.tasks = nil
 		c.phase = JobPhase_Done
@@ -212,18 +217,24 @@ func (c *Coordinator) handleTranPhase(call tranCall) {
 
 func (c *Coordinator) handleDelay(call delayCall) {
 	taskId := call.taskId
-	c.tasks[taskId].taskStatus = TaskStatus_Idle
+	t := &c.tasks[taskId]
+	DPrintf("[Coordinator]: handleDelay 1")
+	if t.taskStatus == TaskStatus_InProgress && time.Now().Sub(t.startTime) > PROCESS_TIME {
+		DPrintf("[Coordinator]: handleDelay 2")
+		c.tasks[taskId].taskStatus = TaskStatus_Idle
+	}
 }
 
 func (c *Coordinator) handleHeartBeat(call heartBeatCall) {
 	reply := call.reply
 	switch c.phase {
 	case JobPhase_Map, JobPhase_Reduce:
-		for _, t := range c.tasks {
-			if (t.taskStatus == TaskStatus_Idle) {
+		for idx := range c.tasks {
+			t := &c.tasks[idx]
+			if t.taskStatus == TaskStatus_Idle {
 				reply.TaskId = t.taskId
 				reply.Type = t.taskType
-				reply.Status = TaskStatus_InProgress
+				reply.Status = t.taskStatus
 				reply.Filename = t.filename
 				reply.NReduce = c.nReduce
 				reply.NMap = c.nMap
@@ -232,9 +243,8 @@ func (c *Coordinator) handleHeartBeat(call heartBeatCall) {
 				return
 			}
 		}
-		reply.Type = TaskType_Wait;
+		reply.Type = TaskType_Wait
 	case JobPhase_Done:
-		c.lastCallAfterDoneTime = time.Now()
 		reply.Type = TaskType_Completed
 	default:
 		reply.Type = TaskType_Wait
@@ -244,7 +254,10 @@ func (c *Coordinator) handleHeartBeat(call heartBeatCall) {
 func (c *Coordinator) handleReport(call reportCall) {
 	taskId := call.args.TaskId
 	state := call.args.State
-	DPrintf("[Coordinator]: handle report id:%v state:%v phase:%v", taskId, state, c.phase)
+	if c.tasks[taskId].taskStatus == TaskStatus_Completed {
+		return
+	}
+	DPrintf("[Coordinator]: handle report id:%v state:%v phase:%v", taskId, state, c.tasks[taskId].taskType)
 	if state == true {
 		c.tasks[taskId].taskStatus = TaskStatus_Completed
 	} else {
@@ -252,38 +265,33 @@ func (c *Coordinator) handleReport(call reportCall) {
 	}
 }
 
-//
 // main/mrcoordinator.go calls Done() periodically to find out
 // if the entire job has finished.
-//
 func (c *Coordinator) Done() bool {
-	done := (c.phase == JobPhase_Done && c.lastCallAfterDoneTime.Add(TERMINATE_TIME).Before(time.Now()))
+	done := c.phase == JobPhase_Terminate
 	if done {
-		DPrintf("[Coordinator] ending...")
-		c.terminateCh <- struct{}{}
+		DPrintf("[Coordinator Done] ending...")
+
 	}
 	return done
 }
 
-//
 // create a Coordinator.
 // main/mrcoordinator.go calls this function.
 // nReduce is the number of reduce tasks to use.
-//
 func MakeCoordinator(files []string, nReduce int) *Coordinator {
 
 	c := Coordinator{
-		splits: files,
-		nMap: len(files),
+		splits:  files,
+		nMap:    len(files),
 		nReduce: nReduce,
-		tasks: nil,
-		phase: JobPhase_Map,
-		lastCallAfterDoneTime: time.Time{},
+		tasks:   nil,
+		phase:   JobPhase_Map,
 
 		heartbeatCh: make(chan heartBeatCall),
-		reportCh: make(chan reportCall),
+		reportCh:    make(chan reportCall),
 		tranPhaseCh: make(chan tranCall),
-		delayCh: make(chan delayCall),
+		delayCh:     make(chan delayCall),
 		terminateCh: make(chan struct{}),
 	}
 	c.init()
