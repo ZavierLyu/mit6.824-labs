@@ -20,6 +20,7 @@ package raft
 import (
 	//	"bytes"
 
+	"slices"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -355,8 +356,112 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	isLeader := true
 
 	// Your code here (2B).
-
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	defer rf.deferPersist()
+	term = rf.currentTerm
+	isLeader = rf.state == StateLeader
+	if !isLeader {
+		return index, term, isLeader
+	}
+	index = len(rf.logs)
+	rf.nextIndex[rf.me] = index + 1
+	rf.matchIndex[rf.me] = index
+	rf.logs = append(rf.logs, LogEntry{Command: command, Term: rf.currentTerm})
+	rf.needPersist = true
+	rf.broadcastAppendEntries()
+	/* if there is only one node, then no bcast works */
+	rf.maybeAdvanceCommitIndex()
 	return index, term, isLeader
+}
+
+/* Deep copy of log slice */
+func (rf *Raft) logEntries(from int) []LogEntry {
+	return append([]LogEntry{}, rf.logs[from:]...)
+}
+
+func (rf *Raft) broadcastAppendEntries() {
+	for i := 0; i < len(rf.peers); i++ {
+		if i == rf.me {
+			continue
+		}
+		go rf.sendAppendEntriesToPeer(i)
+	}
+}
+
+func (rf *Raft) sendAppendEntriesToPeer(id int) {
+	for {
+		args, ok := rf.prepareAppendEntries(id)
+		if !ok {
+			return
+		}
+
+		var reply AppendEntriesReply
+
+		if !rf.sendAppendEntries(id, args, &reply) {
+			return
+		}
+
+		retry := rf.handleAppendEntriesReply(id, args, &reply)
+		if !retry {
+			return
+		}
+	}
+}
+
+func (rf *Raft) handleAppendEntriesReply(id int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	defer rf.deferPersist()
+	sentNextIndex := args.PrevLogIndex + 1
+
+	if reply.Term > rf.currentTerm {
+		rf.becomeFollower(reply.Term)
+		return false
+	}
+
+	if args.Term != rf.currentTerm || rf.state != StateLeader || sentNextIndex != rf.nextIndex[id] {
+		return false
+	}
+
+	if reply.Success {
+		rf.matchIndex[id] = args.PrevLogIndex + len(args.Entries)
+		rf.nextIndex[id] = rf.matchIndex[id] + 1
+		rf.maybeAdvanceCommitIndex()
+		return false
+	} else {
+		rf.nextIndex[id] = max(rf.nextIndex[id]-1, 1)
+		return true
+	}
+}
+
+func (rf *Raft) prepareAppendEntries(id int) (*AppendEntriesArgs, bool) {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	if rf.state != StateLeader {
+		return nil, false
+	}
+	prevLogIndex := rf.nextIndex[id] - 1
+	prevLogTerm := rf.logs[prevLogIndex].Term
+	entries := rf.logEntries(rf.nextIndex[id])
+	args := AppendEntriesArgs{
+		Term:         rf.currentTerm,
+		LeaderId:     rf.me,
+		PrevLogIndex: prevLogIndex,
+		PrevLogTerm:  prevLogTerm,
+		Entries:      entries,
+		LeaderCommit: rf.commitIndex,
+	}
+	return &args, true
+}
+
+func (rf *Raft) maybeAdvanceCommitIndex() {
+	indices := append([]int{}, rf.matchIndex...)
+	slices.Sort(indices)
+	quorumIndex := indices[(len(indices)-1)/2]
+	if quorumIndex > rf.commitIndex && rf.logs[quorumIndex].Term == rf.currentTerm {
+		rf.commitIndex = quorumIndex
+	}
 }
 
 // the tester doesn't halt goroutines created by Raft after each test,
@@ -397,44 +502,11 @@ func (rf *Raft) resetHeartbeatTimer() {
 }
 
 func (rf *Raft) tickHeartbeat() {
-	defer rf.deferPersist()
 	rf.heartbeatElapsed++
 
 	if rf.heartbeatElapsed >= rf.heartbeatTimeout {
 		rf.resetHeartbeatTimer()
-		prevLogIndex := len(rf.logs) - 1
-		prevLogTerm := rf.logs[prevLogIndex].Term
-		args := AppendEntriesArgs{
-			Term:         rf.currentTerm,
-			LeaderId:     rf.me,
-			PrevLogIndex: prevLogIndex,
-			PrevLogTerm:  prevLogTerm,
-			Entries:      []LogEntry{},
-			LeaderCommit: rf.commitIndex,
-		}
-		for i := range rf.peers {
-			if i == rf.me {
-				continue
-			}
-			go func(id int) {
-				reply := AppendEntriesReply{}
-				if ok := rf.sendAppendEntries(id, &args, &reply); ok {
-					rf.mu.Lock()
-					defer rf.mu.Unlock()
-
-					if reply.Term > rf.currentTerm {
-						rf.becomeFollower(reply.Term)
-						rf.persist()
-					}
-
-					if args.Term != rf.currentTerm || rf.state != StateLeader {
-						return
-					}
-
-				}
-			}(i)
-		}
-
+		rf.broadcastAppendEntries()
 	}
 }
 
@@ -482,16 +554,16 @@ func (rf *Raft) startElection() {
 			reply := RequestVoteReply{}
 			if ok := rf.sendRequestVote(id, &args, &reply); ok {
 				rf.mu.Lock()
-				defer rf.mu.Unlock()
 
 				// Judge the reply.Term first, learned the latest info from reply
 				if reply.Term > rf.currentTerm {
 					rf.becomeFollower(reply.Term)
-					rf.persist()
+					rf.mu.Unlock()
 					return
 				}
 				// then check whether the original RPC is expired
 				if rf.currentTerm != args.Term || rf.state != StateCandidate {
+					rf.mu.Unlock()
 					return
 				}
 
@@ -501,6 +573,7 @@ func (rf *Raft) startElection() {
 						rf.becomeLeader()
 					}
 				}
+				rf.mu.Unlock()
 			}
 		}(id)
 	}
@@ -512,7 +585,11 @@ func (rf *Raft) becomeLeader() {
 
 	for i := range rf.peers {
 		rf.nextIndex[i] = len(rf.logs)
-		rf.matchIndex[i] = 0
+		if i == rf.me {
+			rf.matchIndex[i] = len(rf.logs) - 1
+		} else {
+			rf.matchIndex[i] = 0
+		}
 	}
 	rf.heartbeatElapsed = rf.heartbeatTimeout
 }
