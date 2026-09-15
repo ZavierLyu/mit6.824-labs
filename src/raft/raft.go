@@ -333,6 +333,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	}
 }
 
+
 func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
 	ok := rf.peers[server].Call("Raft.AppendEntries", args, reply)
 	return ok
@@ -627,6 +628,31 @@ func (rf *Raft) ticker() {
 	}
 }
 
+func (rf *Raft) applier(applyCh chan ApplyMsg) {
+	for rf.killed() == false {
+		var idxList []int
+		var logList []LogEntry
+		rf.mu.Lock()
+		for i := range rf.commitIndex - rf.lastApplied {
+			idx := rf.lastApplied + i + 1
+			idxList = append(idxList, idx)
+			logList = append(logList, rf.logs[idx])
+		}
+		rf.mu.Unlock()
+		for i, idx := range idxList {
+			applyCh <- ApplyMsg {
+				CommandValid: true,
+				Command: logList[i].Command,
+				CommandIndex: idx,
+			}
+			rf.mu.Lock()
+			rf.lastApplied = idx
+			rf.mu.Unlock()
+		}
+		time.Sleep(time.Duration(20) * time.Millisecond)
+	}
+}
+
 // the service or tester wants to create a Raft server. the ports
 // of all the Raft servers (including this one) are in peers[]. this
 // server's port is peers[me]. all the servers' peers[] arrays
@@ -646,7 +672,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	// Your initialization code here (2A, 2B, 2C).
 	rf.currentTerm = 0
 	rf.votedFor = -1
-	rf.logs = []LogEntry{LogEntry{Term: 0}}
+	rf.logs = []LogEntry{{Term: 0}}
 	rf.commitIndex = 0
 	rf.lastApplied = 0
 	rf.nextIndex = make([]int, len(peers))
@@ -655,7 +681,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 		rf.nextIndex[i] = len(rf.logs)
 		rf.matchIndex[i] = 0
 	}
-	rf.heartbeatTimeout = 2
+	rf.heartbeatTimeout = 10
 	rf.electionTimeout = 20
 	rf.heartbeatElapsed = 0
 	rf.electionElapsed = 0
@@ -672,6 +698,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 
 	// start ticker goroutine to start elections
 	go rf.ticker()
+	go rf.applier(applyCh)
 
 	return rf
 }
